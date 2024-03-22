@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+	"unsafe"
 )
 
 // node represents an in-memory, deserialized page.
@@ -21,6 +22,33 @@ type node struct {
 	pageID      pageID
 	parent      *node
 	children    inodes
+}
+
+// size returns the size of the node after serialization.
+func (n *node) size() int {
+	var elementSize = n.pageElementSize()
+
+	var size = pageHeaderSize
+	for _, item := range n.children {
+		size += elementSize + len(item.key) + len(item.value)
+	}
+	return size
+}
+
+// pageElementSize returns the size of each page element based on the type of node.
+func (n *node) pageElementSize() int {
+	if n.isLeaf {
+		return leafPageElementSize
+	}
+	return branchPageElementSize
+}
+
+// root returns the root node in the tree.
+func (n *node) root() *node {
+	if n.parent == nil {
+		return n
+	}
+	return n.parent.root()
 }
 
 // childAt returns the child node at a given index.
@@ -92,6 +120,59 @@ func (n *node) read(p *page) {
 		n.key = nil
 	}
 }
+
+// write writes the items onto one or more pages.
+func (n *node) write(p *page) {
+	// Initialize page.
+	if n.isLeaf {
+		p.flags |= leafPageFlag
+	} else {
+		p.flags |= branchPageFlag
+	}
+	p.count = uint16(len(n.children))
+
+	// Loop over each item and write it to the page.
+	b := (*[maxAllocSize]byte)(unsafe.Pointer(&p.ptr))[n.pageElementSize()*len(n.children):]
+	for i, item := range n.children {
+		// Write the page element.
+		if n.isLeaf {
+			elem := p.leafPageElement(uint16(i))
+			elem.pos = uint32(uintptr(unsafe.Pointer(&b[0])) - uintptr(unsafe.Pointer(elem)))
+			elem.ksize = uint32(len(item.key))
+			elem.vsize = uint32(len(item.value))
+		} else {
+			elem := p.branchPageElement(uint16(i))
+			elem.pos = uint32(uintptr(unsafe.Pointer(&b[0])) - uintptr(unsafe.Pointer(elem)))
+			elem.ksize = uint32(len(item.key))
+			elem.pageID = item.pageID
+		}
+
+		// Write data for the element to the end of the page.
+		copy(b[0:], item.key)
+		b = b[len(item.key):]
+		copy(b[0:], item.value)
+		b = b[len(item.value):]
+	}
+}
+
+// split divides up the node into appropriately sized nodes.
+func (n *node) split(pageSize int) []*node {
+	// Ignore the split if the page doesn't have at least enough nodes for
+	// multiple pages or if the data can fit on a single page.
+	if len(n.children) <= (minKeysPerPage*2) || n.size() < pageSize {
+		return []*node{n}
+	}
+
+	// TODO
+	return nil
+}
+
+// nodesByDepth sorts a list of branches by deepest first.
+type nodesByDepth []*node
+
+func (s nodesByDepth) Len() int           { return len(s) }
+func (s nodesByDepth) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s nodesByDepth) Less(i, j int) bool { return s[i].depth > s[j].depth }
 
 // inode represents an internal node inside of a node.
 // It can be used to point to elements in a page or

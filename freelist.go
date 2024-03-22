@@ -44,6 +44,18 @@ func (f *freelist) allocate(n int) pageID {
 	return 0
 }
 
+// free releases a page and its overflow for a given transaction id.
+func (f *freelist) free(txID txID, p *page) {
+	var ids = f.pendingPageIDMap[txID]
+	if p.id <= 1 {
+		panic(fmt.Sprintf("assertion failed: cannot free page 0 or 1: %d", p.id))
+	}
+	for i := 0; i < int(p.overflow+1); i++ {
+		ids = append(ids, p.id+pageID(i))
+	}
+	f.pendingPageIDMap[txID] = ids
+}
+
 // release moves all page ids for a transaction id (or older) to the freelist.
 func (f *freelist) release(txID txID) {
 	// TODO

@@ -1,7 +1,10 @@
 package toyboltdb
 
 import (
+	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"os"
 	"syscall"
 	"testing"
@@ -166,7 +169,9 @@ func TestDBTransactionBlockWhileClosed(t *testing.T) {
 
 // withDB executes a function with a database reference.
 func withDB(fn func(*DB, string)) {
-	f, _ := os.CreateTemp("", "myboltdb-")
+	name := "myboltdb-" + fmt.Sprintf("%d", rand.Int63n(math.MaxInt64))
+	fmt.Println(name)
+	f, _ := os.CreateTemp("", name)
 	path := f.Name()
 	f.Close()
 	os.Remove(path)

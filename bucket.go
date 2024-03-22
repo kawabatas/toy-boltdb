@@ -145,3 +145,13 @@ func (b *buckets) write(p *page) {
 		buf = buf[len(key):]
 	}
 }
+
+// updateRootPageID finds a bucket by root id and then updates it to point to a new root.
+func (b *buckets) updateRootPageID(oldid, newid pageID) {
+	for _, b := range b.bucketMap {
+		if b.rootPageID == oldid {
+			b.rootPageID = newid
+			return
+		}
+	}
+}

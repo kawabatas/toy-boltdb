@@ -53,3 +53,30 @@ func TestNodeReadLeafPage(t *testing.T) {
 	assert.Equal(t, n.children[1].key, []byte("helloworld"))
 	assert.Equal(t, n.children[1].value, []byte("bye"))
 }
+
+// Ensure that a node can serialize into a leaf page.
+func TestNodeWriteLeafPage(t *testing.T) {
+	// Create a node.
+	n := &node{isLeaf: true, children: make(inodes, 0)}
+	n.put([]byte("susy"), []byte("susy"), []byte("que"), 0)
+	n.put([]byte("ricki"), []byte("ricki"), []byte("lake"), 0)
+	n.put([]byte("john"), []byte("john"), []byte("johnson"), 0)
+
+	// Write it to a page.
+	var buf [4096]byte
+	p := (*page)(unsafe.Pointer(&buf[0]))
+	n.write(p)
+
+	// Read the page back in.
+	n2 := &node{}
+	n2.read(p)
+
+	// Check that the two pages are the same.
+	assert.Equal(t, len(n2.children), 3)
+	assert.Equal(t, n2.children[0].key, []byte("john"))
+	assert.Equal(t, n2.children[0].value, []byte("johnson"))
+	assert.Equal(t, n2.children[1].key, []byte("ricki"))
+	assert.Equal(t, n2.children[1].value, []byte("lake"))
+	assert.Equal(t, n2.children[2].key, []byte("susy"))
+	assert.Equal(t, n2.children[2].value, []byte("que"))
+}
