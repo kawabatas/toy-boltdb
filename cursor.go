@@ -8,6 +8,9 @@ package toyboltdb
 // Cursor represents an iterator that can traverse over all key/value pairs in a **bucket** in sorted order.
 // Cursors can be obtained from a Transaction and are valid as long as the Transaction is open.
 type Cursor struct {
+	transaction *Transaction
+	rootPageID  pageID
+	stack       []pageElementRef
 }
 
 // First moves the cursor to the first item in the bucket and returns its key and value.
