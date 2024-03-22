@@ -24,6 +24,14 @@ type node struct {
 	children    inodes
 }
 
+// minKeys returns the minimum number of inodes this node should have.
+func (n *node) minKeys() int {
+	if n.isLeaf {
+		return 1
+	}
+	return 2
+}
+
 // size returns the size of the node after serialization.
 func (n *node) size() int {
 	var elementSize = n.pageElementSize()
@@ -57,6 +65,41 @@ func (n *node) childAt(index int) *node {
 		panic(fmt.Sprintf("assertion failed: invalid childAt(%d) on a leaf node", index))
 	}
 	return n.transaction.node(n.children[index].pageID, n)
+}
+
+// childIndex returns the index of a given child node.
+func (n *node) childIndex(child *node) int {
+	index := sort.Search(len(n.children), func(i int) bool { return bytes.Compare(n.children[i].key, child.key) != -1 })
+	return index
+}
+
+// numChildren returns the number of children.
+func (n *node) numChildren() int {
+	return len(n.children)
+}
+
+// nextSibling returns the next node with the same parent.
+func (n *node) nextSibling() *node {
+	if n.parent == nil {
+		return nil
+	}
+	index := n.parent.childIndex(n)
+	if index >= n.parent.numChildren()-1 {
+		return nil
+	}
+	return n.parent.childAt(index + 1)
+}
+
+// prevSibling returns the previous node with the same parent.
+func (n *node) prevSibling() *node {
+	if n.parent == nil {
+		return nil
+	}
+	index := n.parent.childIndex(n)
+	if index == 0 {
+		return nil
+	}
+	return n.parent.childAt(index - 1)
 }
 
 // put inserts a key/value.
@@ -155,6 +198,119 @@ func (n *node) write(p *page) {
 	}
 }
 
+// rebalance attempts to combine the node with sibling nodes if the node fill
+// size is below a threshold or if there are not enough keys.
+func (n *node) rebalance() {
+	if !n.unbalanced {
+		return
+	}
+	n.unbalanced = false
+
+	// Ignore if node is above threshold (25%) and has enough keys.
+	var threshold = n.transaction.db.pageSize / 4
+	if n.size() > threshold && len(n.children) > n.minKeys() {
+		return
+	}
+
+	// Root node has special handling.
+	if n.parent == nil {
+		// If root node is a branch and only has one node then collapse it.
+		if !n.isLeaf && len(n.children) == 1 {
+			// Move child's children up.
+			child := n.transaction.nodes[n.children[0].pageID]
+			n.isLeaf = child.isLeaf
+			n.children = child.children[:]
+
+			// Reparent all child nodes being moved.
+			for _, inode := range n.children {
+				if child, ok := n.transaction.nodes[inode.pageID]; ok {
+					child.parent = n
+				}
+			}
+
+			// Remove old child.
+			child.parent = nil
+			delete(n.transaction.nodes, child.pageID)
+		}
+		return
+	}
+
+	if n.parent.numChildren() < 2 {
+		panic("assertion failed: parent must have at least 2 children")
+	}
+
+	// Destination node is right sibling if idx == 0, otherwise left sibling.
+	var target *node
+	var useNextSibling = (n.parent.childIndex(n) == 0)
+	if useNextSibling {
+		target = n.nextSibling()
+	} else {
+		target = n.prevSibling()
+	}
+
+	// If target node has extra nodes then just move one over.
+	if target.numChildren() > target.minKeys() {
+		if useNextSibling {
+			// Reparent and move node.
+			if child, ok := n.transaction.nodes[target.children[0].pageID]; ok {
+				child.parent = n
+			}
+			n.children = append(n.children, target.children[0])
+			target.children = target.children[1:]
+
+			// Update target key on parent.
+			target.parent.put(target.key, target.children[0].key, nil, target.pageID)
+			target.key = target.children[0].key
+		} else {
+			// Reparent and move node.
+			if child, ok := n.transaction.nodes[target.children[len(target.children)-1].pageID]; ok {
+				child.parent = n
+			}
+			n.children = append(n.children, inode{})
+			copy(n.children[1:], n.children)
+			n.children[0] = target.children[len(target.children)-1]
+			target.children = target.children[:len(target.children)-1]
+		}
+
+		// Update parent key for node.
+		n.parent.put(n.key, n.children[0].key, nil, n.pageID)
+		n.key = n.children[0].key
+
+		return
+	}
+
+	// If both this node and the target node are too small then merge them.
+	if useNextSibling {
+		// Reparent all child nodes being moved.
+		for _, inode := range target.children {
+			if child, ok := n.transaction.nodes[inode.pageID]; ok {
+				child.parent = n
+			}
+		}
+
+		// Copy over inodes from target and remove target.
+		n.children = append(n.children, target.children...)
+		n.parent.del(target.key)
+		delete(n.transaction.nodes, target.pageID)
+	} else {
+		// Reparent all child nodes being moved.
+		for _, inode := range n.children {
+			if child, ok := n.transaction.nodes[inode.pageID]; ok {
+				child.parent = target
+			}
+		}
+
+		// Copy over inodes to target and remove node.
+		target.children = append(target.children, n.children...)
+		n.parent.del(n.key)
+		n.parent.put(target.key, target.children[0].key, nil, target.pageID)
+		delete(n.transaction.nodes, n.pageID)
+	}
+
+	// Either this node or the target node was deleted from the parent so rebalance it.
+	n.parent.rebalance()
+}
+
 // split divides up the node into appropriately sized nodes.
 func (n *node) split(pageSize int) []*node {
 	// Ignore the split if the page doesn't have at least enough nodes for
@@ -163,8 +319,32 @@ func (n *node) split(pageSize int) []*node {
 		return []*node{n}
 	}
 
-	// TODO
-	return nil
+	// Set fill threshold to 50%.
+	threshold := pageSize / 2
+
+	// Group into smaller pages and target a given fill size.
+	size := pageHeaderSize
+	inodes := n.children
+	current := n
+	current.children = nil
+	var nodes []*node
+
+	for i, inode := range inodes {
+		elemSize := n.pageElementSize() + len(inode.key) + len(inode.value)
+
+		// divide new node
+		if len(current.children) >= minKeysPerPage && i < len(inodes)-minKeysPerPage && size+elemSize > threshold {
+			size = pageHeaderSize
+			nodes = append(nodes, current)
+			current = &node{transaction: n.transaction, isLeaf: n.isLeaf}
+		}
+
+		size += elemSize
+		current.children = append(current.children, inode)
+	}
+	nodes = append(nodes, current)
+
+	return nodes
 }
 
 // nodesByDepth sorts a list of branches by deepest first.
