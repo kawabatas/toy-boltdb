@@ -275,6 +275,52 @@ func (db *DB) close() {
 	db.munmap()
 }
 
+// txBegin creates a read-only transaction.
+// Multiple read-only transactions can be used concurrently.
+//
+// IMPORTANT: You must close the transaction after you are finished or else the database will not reclaim old pages.
+func (db *DB) txBegin() (*Transaction, error) {
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+
+	// Exit if the database is not open yet.
+	if !db.isOpened {
+		return nil, ErrDatabaseNotOpen
+	}
+
+	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
+	// obtain a write lock so all transactions must finish before it can be
+	// remapped.
+	db.mmaplock.RLock()
+
+	// Create a transaction associated with the database.
+	t := &Transaction{}
+	t.init(db)
+
+	// Keep track of transaction until it closes.
+	db.txs = append(db.txs, t)
+
+	return t, nil
+}
+
+// txEnd removes a transaction from the database.
+// This is called from Close() on the transaction.
+func (db *DB) txEnd(t *Transaction) {
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+
+	// Release the read lock on the mmap.
+	db.mmaplock.RUnlock()
+
+	// Remove the transaction.
+	for i, tx := range db.txs {
+		if tx == t {
+			db.txs = append(db.txs[:i], db.txs[i+1:]...)
+			break
+		}
+	}
+}
+
 // Update executes a function within the context of a RWTransaction.
 // If no error is returned from the function then the transaction is committed.
 // If an error is returned then the entire transaction is rolled back.
@@ -287,7 +333,14 @@ func (db *DB) Update(fn func(*RWTransaction) error) error {
 // View executes a function within the context of a Transaction.
 // Any error that is returned from the function is returned from the View() method.
 func (db *DB) View(fn func(*Transaction) error) error {
-	return nil
+	t, err := db.txBegin()
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	// If an error is returned from the function then pass it through.
+	return fn(t)
 }
 
 // meta retrieves the current meta page reference.

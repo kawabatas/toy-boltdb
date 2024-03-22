@@ -19,9 +19,25 @@ type Transaction struct {
 // txID represents the internal transaction identifier.
 type txID uint64
 
+// init initializes the transaction and associates it with a database.
+func (t *Transaction) init(db *DB) {
+	t.db = db
+	t.pages = nil
+
+	// Copy the meta page since it can be changed by the writer.
+	t.meta = &meta{}
+	db.meta().copy(t.meta)
+
+	// Read in the buckets page.
+	//
+	// A page has many buckets, thus transactions.
+	t.buckets = &buckets{}
+	t.buckets.read(t.page(t.meta.bucketsPageID))
+}
+
 // Close closes the transaction and releases any pages it is using.
 func (t *Transaction) Close() {
-	// TODO
+	t.db.txEnd(t)
 }
 
 // Bucket retrieves a bucket by name.
@@ -83,6 +99,13 @@ func (t *Transaction) ForEach(name string, fn func(k, v []byte) error) error {
 // page returns a reference to the page with a given id.
 // If page has been written to then a temporary bufferred page is returned.
 func (t *Transaction) page(id pageID) *page {
-	// TODO
-	return nil
+	// Check the dirty pages first.
+	if t.pages != nil {
+		if p, ok := t.pages[id]; ok {
+			return p
+		}
+	}
+
+	// Otherwise return directly from the mmap.
+	return t.db.page(id)
 }
