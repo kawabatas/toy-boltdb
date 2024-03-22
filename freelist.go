@@ -2,6 +2,7 @@ package toyboltdb
 
 import (
 	"fmt"
+	"sort"
 	"unsafe"
 )
 
@@ -58,7 +59,13 @@ func (f *freelist) free(txID txID, p *page) {
 
 // release moves all page ids for a transaction id (or older) to the freelist.
 func (f *freelist) release(txID txID) {
-	// TODO
+	for tid, ids := range f.pendingPageIDMap {
+		if tid <= txID {
+			f.pageIDs = append(f.pageIDs, ids...)
+			delete(f.pendingPageIDMap, tid)
+		}
+	}
+	sort.Sort(reverseSortedPageIDs(f.pageIDs))
 }
 
 // read initializes the freelist from a freelist page.
@@ -67,3 +74,9 @@ func (f *freelist) read(p *page) {
 	f.pageIDs = make([]pageID, len(ids))
 	copy(f.pageIDs, ids)
 }
+
+type reverseSortedPageIDs []pageID
+
+func (s reverseSortedPageIDs) Len() int           { return len(s) }
+func (s reverseSortedPageIDs) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s reverseSortedPageIDs) Less(i, j int) bool { return s[i] > s[j] }

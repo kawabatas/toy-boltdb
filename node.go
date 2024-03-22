@@ -347,6 +347,26 @@ func (n *node) split(pageSize int) []*node {
 	return nodes
 }
 
+// dereference causes the node to copy all its inode key/value references to heap memory.
+// This is required when the mmap is reallocated so inodes are not pointing to stale data.
+func (n *node) dereference() {
+	key := make([]byte, len(n.key))
+	copy(key, n.key)
+	n.key = key
+
+	for i := range n.children {
+		inode := &n.children[i]
+
+		key := make([]byte, len(inode.key))
+		copy(key, inode.key)
+		inode.key = key
+
+		value := make([]byte, len(inode.value))
+		copy(value, inode.value)
+		inode.value = value
+	}
+}
+
 // nodesByDepth sorts a list of branches by deepest first.
 type nodesByDepth []*node
 

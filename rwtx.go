@@ -349,5 +349,11 @@ func (t *RWTransaction) writeMeta() error {
 
 // dereference removes all references to the old mmap.
 func (t *RWTransaction) dereference() {
-	// TODO
+	for _, n := range t.nodes {
+		n.dereference()
+	}
+
+	for _, n := range t.pending {
+		n.dereference()
+	}
 }
