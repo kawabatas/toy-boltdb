@@ -160,3 +160,29 @@ func (c *Cursor) nsearch(key []byte, p *page) {
 	})
 	e.index = uint16(index)
 }
+
+// node returns the node that the cursor is currently positioned on.
+func (c *Cursor) node(t *RWTransaction) *node {
+	if len(c.stack) == 0 {
+		panic("assertion failed: accessing a node with a zero-length cursor stack")
+	}
+
+	// Start from root and traverse down the hierarchy.
+	n := t.node(c.stack[0].page.id, nil)
+	for _, ref := range c.stack[:len(c.stack)-1] {
+		if n.isLeaf {
+			panic("assertion failed: expected branch node")
+		}
+		if ref.page.id != n.pageID {
+			panic(fmt.Sprintf("assertion failed: node/page mismatch a: %d != %d", ref.page.id, n.childAt(int(ref.index)).pageID))
+		}
+		n = n.childAt(int(ref.index))
+	}
+	if !n.isLeaf {
+		panic("assertion failed: expected leaf node")
+	}
+	if n.pageID != c.stack[len(c.stack)-1].page.id {
+		panic(fmt.Sprintf("assertion failed: node/page mismatch b: %d != %d", n.pageID, c.stack[len(c.stack)-1].page.id))
+	}
+	return n
+}

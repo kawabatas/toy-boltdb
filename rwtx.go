@@ -10,9 +10,9 @@
 package toyboltdb
 
 const (
-	// MaxKeySize        = 32768      // 16bit
-	// MaxValueSize      = 4294967295 // 32bit
-	MaxBucketNameSize = 255 // 8bit
+	MaxKeySize        = 32768      // 16bit
+	MaxValueSize      = 4294967295 // 32bit
+	MaxBucketNameSize = 255        // 8bit
 )
 
 // RWTransaction represents a transaction that can read and write data.
@@ -110,6 +110,27 @@ func (t *RWTransaction) NextSequence(name string) (int, error) {
 // If the key exist then its previous value will be overwritten.
 // Returns an error if the bucket is not found, if the key is blank, if the key is too large, or if the value is too large.
 func (t *RWTransaction) Put(name string, key []byte, value []byte) error {
+	b := t.Bucket(name)
+	if b == nil {
+		return ErrBucketNotFound
+	}
+
+	// Validate the key and data size.
+	if len(key) == 0 {
+		return ErrKeyRequired
+	} else if len(key) > MaxKeySize {
+		return ErrKeyTooLarge
+	} else if len(value) > MaxValueSize {
+		return ErrValueTooLarge
+	}
+
+	// Move cursor to correct position.
+	c := b.Cursor()
+	c.Get(key)
+
+	// Insert the key/value.
+	c.node(t).put(key, key, value, 0)
+
 	return nil
 }
 
@@ -117,6 +138,18 @@ func (t *RWTransaction) Put(name string, key []byte, value []byte) error {
 // If the key does not exist then nothing is done and a nil error is returned.
 // Returns an error if the bucket cannot be found.
 func (t *RWTransaction) Delete(name string, key []byte) error {
+	b := t.Bucket(name)
+	if b == nil {
+		return ErrBucketNotFound
+	}
+
+	// Move cursor to correct position.
+	c := b.Cursor()
+	c.Get(key)
+
+	// Delete the node if we have a matching key.
+	c.node(t).del(key)
+
 	return nil
 }
 
@@ -131,6 +164,24 @@ func (t *RWTransaction) allocate(count int) (*page, error) {
 	t.pages[p.id] = p
 
 	return p, nil
+}
+
+// node creates a node from a page and associates it with a given parent.
+func (t *RWTransaction) node(pageID pageID, parent *node) *node {
+	// Retrieve node if it has already been fetched.
+	if n := t.nodes[pageID]; n != nil {
+		return n
+	}
+
+	// Otherwise create a branch and cache it.
+	n := &node{transaction: t, parent: parent}
+	if n.parent != nil {
+		n.depth = n.parent.depth + 1
+	}
+	n.read(t.page(pageID))
+	t.nodes[pageID] = n
+
+	return n
 }
 
 // dereference removes all references to the old mmap.
