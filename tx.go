@@ -42,3 +42,10 @@ func (t *Transaction) Get(name string, key []byte) (value []byte, err error) {
 func (t *Transaction) ForEach(name string, fn func(k, v []byte) error) error {
 	return nil
 }
+
+// page returns a reference to the page with a given id.
+// If page has been written to then a temporary bufferred page is returned.
+func (t *Transaction) page(id pageID) *page {
+	// TODO
+	return nil
+}
