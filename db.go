@@ -321,13 +321,63 @@ func (db *DB) txEnd(t *Transaction) {
 	}
 }
 
+// rwtxBegin creates a read/write transaction.
+// Only one read/write transaction is allowed at a time.
+// You must call Commit() or Rollback() on the transaction to close it.
+func (db *DB) rwtxBegin() (*RWTransaction, error) {
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+
+	// Exit if the database is not open yet.
+	if !db.isOpened {
+		return nil, ErrDatabaseNotOpen
+	}
+
+	// Obtain writer lock. This is released by the RWTransaction when it closes.
+	db.rwlock.Lock()
+
+	// Create a transaction associated with the database.
+	t := &RWTransaction{nodes: make(map[pageID]*node)}
+	t.init(db)
+	db.rwtx = t
+
+	// Free any pages associated with closed read-only transactions.
+	var minid txID = 0xFFFFFFFFFFFFFFFF
+	for _, t := range db.txs {
+		if t.meta.txID < minid {
+			minid = t.meta.txID
+		}
+	}
+	if minid > 0 {
+		db.freelist.release(minid - 1)
+	}
+
+	return t, nil
+}
+
+// rwtxEnd is called from Commit() or Rollback() on the transaction.
+func (db *DB) rwtxEnd() {
+	db.rwlock.Unlock()
+}
+
 // Update executes a function within the context of a RWTransaction.
 // If no error is returned from the function then the transaction is committed.
 // If an error is returned then the entire transaction is rolled back.
 // Any error that is returned from the function or returned from the commit is
 // returned from the Update() method.
 func (db *DB) Update(fn func(*RWTransaction) error) error {
-	return nil
+	t, err := db.rwtxBegin()
+	if err != nil {
+		return err
+	}
+
+	// If an error is returned from the function then rollback and return error.
+	if err := fn(t); err != nil {
+		t.Rollback()
+		return err
+	}
+
+	return t.Commit()
 }
 
 // View executes a function within the context of a Transaction.

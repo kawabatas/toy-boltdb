@@ -14,6 +14,17 @@ package toyboltdb
 // RWTransaction is composed of a read-only Transaction so it can also use
 // functions provided by Transaction.
 type RWTransaction struct {
+	Transaction
+	nodes map[pageID]*node // cache
+}
+
+// init initializes the transaction.
+func (t *RWTransaction) init(db *DB) {
+	t.Transaction.init(db)
+	t.pages = make(map[pageID]*page)
+
+	// Increment the transaction id.
+	t.meta.txID += txID(1)
 }
 
 // Commit writes all changes to **disk** and updates the **meta page**.
