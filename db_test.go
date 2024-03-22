@@ -142,6 +142,28 @@ func TestDBMmapSize(t *testing.T) {
 	assert.Equal(t, db.mmapSize(1<<30), 1<<31)
 }
 
+// Ensure a closed database returns an error while running a transaction block
+func TestDBRWTransactionBlockWhileClosed(t *testing.T) {
+	withDB(func(db *DB, path string) {
+		err := db.Update(func(txn *RWTransaction) error {
+			txn.CreateBucket("widgets")
+			return nil
+		})
+		assert.Equal(t, err, ErrDatabaseNotOpen)
+	})
+}
+
+// Ensure a closed database returns an error while running a transaction block
+func TestDBTransactionBlockWhileClosed(t *testing.T) {
+	withDB(func(db *DB, path string) {
+		err := db.View(func(txn *Transaction) error {
+			txn.Bucket("widgets")
+			return nil
+		})
+		assert.Equal(t, err, ErrDatabaseNotOpen)
+	})
+}
+
 // withDB executes a function with a database reference.
 func withDB(fn func(*DB, string)) {
 	f, _ := os.CreateTemp("", "myboltdb-")

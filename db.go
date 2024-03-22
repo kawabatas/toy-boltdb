@@ -410,3 +410,30 @@ func (db *DB) page(id pageID) *page {
 func (db *DB) pageInBuffer(b []byte, id pageID) *page {
 	return (*page)(unsafe.Pointer(&b[id*pageID(db.pageSize)]))
 }
+
+// allocate returns a contiguous block of memory starting at a given page.
+func (db *DB) allocate(count int) (*page, error) {
+	// Allocate a temporary buffer for the page.
+	buf := make([]byte, count*db.pageSize)
+	p := (*page)(unsafe.Pointer(&buf[0]))
+	p.overflow = uint32(count - 1)
+
+	// Use pages from the freelist **if they are available**.
+	if p.id = db.freelist.allocate(count); p.id != 0 {
+		return p, nil
+	}
+
+	// Resize mmap() if we're at the end.
+	p.id = db.rwtx.meta.pageID
+	var minsz = int((p.id+pageID(count))+1) * db.pageSize
+	if minsz >= len(db.mmapdata) {
+		if err := db.mmap(minsz); err != nil {
+			return nil, fmt.Errorf("mmap allocate error: %w", err)
+		}
+	}
+
+	// Move the page id high water mark.
+	db.rwtx.meta.pageID += pageID(count)
+
+	return p, nil
+}
