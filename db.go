@@ -1,17 +1,47 @@
 package toyboltdb
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"syscall"
+	"unsafe"
+)
+
+const (
+	minMmapSize = 1 << 22 // 4MB
+	maxMmapStep = 1 << 30 // 1GB
+)
+
+const (
+	errMsgStat         = "stat error"
+	errMsgMeta         = "meta error"
+	errMsgFileTooSmall = "file size too small"
+	errMsgMmapStat     = "mmap stat error"
 )
 
 // DB represents a collection of buckets persisted to a file on disk.
 // All data access is performed through transactions which can be obtained through the DB.
 // All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
 type DB struct {
-	os      _os
-	syscall _syscall
-	path    string
+	os       _os
+	syscall  _syscall
+	path     string
+	file     file
+	metafile file
+	mmapdata []byte // mmap
+	meta0    *meta
+	meta1    *meta
+	pageSize int
+	isOpened bool
+	rwtx     *RWTransaction
+	txs      []*Transaction
+	freelist *freelist
+
+	rwlock   sync.Mutex   // Allows only one writer at a time.
+	metalock sync.Mutex   // Protects meta page access.
+	mmaplock sync.RWMutex // Protects mmap access during remapping.
 }
 
 func (db *DB) Path() string {
@@ -38,12 +68,211 @@ func (db *DB) String() string {
 // - mmap
 // - reference the above pages to the db
 func (db *DB) Open(path string, mode os.FileMode) error {
+	var err error
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+
+	// Initialize OS/Syscall references.
+	// These are overridden by mocks during some tests.
+	if db.os == nil {
+		db.os = &sysos{}
+	}
+	if db.syscall == nil {
+		db.syscall = &syssyscall{}
+	}
+
+	// Exit if the database is currently open.
+	if db.isOpened {
+		return ErrDatabaseOpen
+	}
+
+	// Open data file and separate **sync handler** for metadata writes.
+	db.path = path
+	if db.file, err = db.os.OpenFile(db.path, os.O_RDWR|os.O_CREATE, mode); err != nil {
+		db.close()
+		return err
+	}
+	if db.metafile, err = db.os.OpenFile(db.path, os.O_RDWR|os.O_SYNC, mode); err != nil {
+		db.close()
+		return err
+	}
+
+	// Initialize the database if it doesn't exist.
+	if info, err := db.file.Stat(); err != nil {
+		return fmt.Errorf("%s: %w", errMsgStat, err)
+	} else if info.Size() == 0 {
+		// Initialize new files with meta pages.
+		if err := db.init(); err != nil {
+			return err
+		}
+	} else {
+		// Read the first meta page to determine the page size.
+		var buf [0x1000]byte // QQQ 0x1000 -> 4096 4KiB the default page size?
+		if _, err := db.file.ReadAt(buf[:], 0); err == nil {
+			// pageID 0
+			m := db.pageInBuffer(buf[:], 0).meta()
+			if err := m.validate(); err != nil {
+				return fmt.Errorf("%s: %w", errMsgMeta, err)
+			}
+			db.pageSize = int(m.pageSize)
+		}
+	}
+
+	// Memory map the data file.
+	if err := db.mmap(0); err != nil {
+		db.close()
+		return err
+	}
+
+	// Read in the freelist.
+	db.freelist = &freelist{pendingPageIDMap: make(map[txID][]pageID)}
+	db.freelist.read(db.page(db.meta().freelistPageID))
+
+	// Mark the database as opened and return.
+	db.isOpened = true
 	return nil
+}
+
+// init creates a new database file and initializes its meta pages.
+//
+// | M(0) | M(1) | F(2) | D(3)        | | | | | |
+// |	    |      |      | leaf bucket
+//
+// and write to our data file
+func (db *DB) init() error {
+	// Set the page size to the OS page size.
+	db.pageSize = db.os.Getpagesize()
+
+	// Create two meta pages on a buffer.
+	buf := make([]byte, db.pageSize*4) // M,M,F,D
+	for i := 0; i < 2; i++ {
+		p := db.pageInBuffer(buf[:], pageID(i))
+		p.id = pageID(i)
+		p.flags = metaPageFlag
+
+		// Initialize the meta page.
+		m := p.meta()
+		m.magic = magic
+		m.version = version
+		m.pageSize = uint32(db.pageSize)
+		m.freelistPageID = 2
+		m.bucketsPageID = 3
+		m.pageID = 4
+		m.txID = txID(i) // tx 0, tx 1
+	}
+
+	// Write an empty freelist at page 3.
+	p := db.pageInBuffer(buf[:], pageID(2))
+	p.id = pageID(2)
+	p.flags = freelistPageFlag
+	p.count = 0
+
+	// Write an empty leaf page at page 4.
+	p = db.pageInBuffer(buf[:], pageID(3))
+	p.id = pageID(3)
+	p.flags = bucketsPageFlag
+	p.count = 0
+
+	// Write the buffer to our data file.
+	if _, err := db.metafile.WriteAt(buf, 0); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// mmap opens the underlying memory-mapped file and initializes the meta references.
+// minsz is the minimum size that the new mmap can be.
+func (db *DB) mmap(minsz int) error {
+	db.mmaplock.Lock()
+	defer db.mmaplock.Unlock()
+
+	// Dereference all mmap references before unmapping.
+	if db.rwtx != nil {
+		db.rwtx.dereference()
+	}
+
+	// Unmap existing data before continuing.
+	db.munmap()
+
+	info, err := db.file.Stat()
+	if err != nil {
+		return fmt.Errorf("%s: %w", errMsgMmapStat, err)
+	} else if int(info.Size()) < db.pageSize*2 {
+		return errors.New(errMsgFileTooSmall)
+	}
+
+	// Ensure the size is at least the minimum size.
+	var size = int(info.Size())
+	if size < minsz {
+		size = minsz
+	}
+	size = db.mmapSize(minsz)
+
+	// mmap() syscall: allocate new memory space to a running process
+	// Memory-map the data file as a byte slice.
+	if db.mmapdata, err = db.syscall.Mmap(int(db.file.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED); err != nil {
+		return err
+	}
+
+	// Save references to the meta pages.
+	db.meta0 = db.page(0).meta()
+	db.meta1 = db.page(1).meta()
+	// Validate the meta pages.
+	if err := db.meta0.validate(); err != nil {
+		return fmt.Errorf("meta0 error: %w", err)
+	}
+	if err := db.meta1.validate(); err != nil {
+		return fmt.Errorf("meta1 error: %w", err)
+	}
+	return nil
+}
+
+// munmap unmaps the data file from memory.
+func (db *DB) munmap() {
+	if db.mmapdata != nil {
+		if err := db.syscall.Munmap(db.mmapdata); err != nil {
+			panic("unmap error: " + err.Error())
+		}
+		db.mmapdata = nil
+	}
+}
+
+// mmapSize determines the appropriate size for the mmap given the current size
+// of the database. The minimum size is 4MB and doubles until it reaches 1GB.
+func (db *DB) mmapSize(size int) int {
+	if size < minMmapSize {
+		return minMmapSize
+	} else if size < maxMmapStep {
+		size *= 2
+	} else {
+		size += maxMmapStep
+	}
+
+	// Ensure that the mmap size is a multiple of the page size.
+	if (size % db.pageSize) != 0 {
+		size = ((size / db.pageSize) + 1) * db.pageSize
+	}
+
+	return size
 }
 
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() {
+	db.metalock.Lock()
+	defer db.metalock.Unlock()
+	db.close()
+}
+
+func (db *DB) close() {
+	db.isOpened = false
+
+	// TODO(benbjohnson): Undo everything in Open().
+	db.freelist = nil
+	db.path = ""
+
+	db.munmap()
 }
 
 // Update executes a function within the context of a RWTransaction.
@@ -59,4 +288,22 @@ func (db *DB) Update(fn func(*RWTransaction) error) error {
 // Any error that is returned from the function is returned from the View() method.
 func (db *DB) View(fn func(*Transaction) error) error {
 	return nil
+}
+
+// meta retrieves the current meta page reference.
+func (db *DB) meta() *meta {
+	if db.meta0.txID > db.meta1.txID {
+		return db.meta0
+	}
+	return db.meta1
+}
+
+// page retrieves a page reference from the mmap based on the current page size.
+func (db *DB) page(id pageID) *page {
+	return (*page)(unsafe.Pointer(&db.mmapdata[id*pageID(db.pageSize)]))
+}
+
+// pageInBuffer retrieves a page reference from a given byte array based on the current page size.
+func (db *DB) pageInBuffer(b []byte, id pageID) *page {
+	return (*page)(unsafe.Pointer(&b[id*pageID(db.pageSize)]))
 }

@@ -62,3 +62,8 @@ func (t *RWTransaction) Put(name string, key []byte, value []byte) error {
 func (t *RWTransaction) Delete(name string, key []byte) error {
 	return nil
 }
+
+// dereference removes all references to the old mmap.
+func (t *RWTransaction) dereference() {
+	// TODO
+}
